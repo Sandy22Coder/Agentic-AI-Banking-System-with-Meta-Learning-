@@ -1,0 +1,9 @@
+bank,min_credit_score,min_income,max_dti,interest_rate
+HDFC,700,40000,0.40,0.090
+ICICI,680,35000,0.45,0.095
+SBI,650,30000,0.50,0.100
+Axis Bank,690,38000,0.42,0.092
+Kotak Mahindra,710,45000,0.38,0.088
+Bank of Baroda,640,28000,0.52,0.105
+PNB,660,32000,0.48,0.098
+Yes Bank,670,34000,0.46,0.102
