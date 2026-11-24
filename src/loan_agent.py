@@ -15,210 +15,206 @@ Pipeline Steps:
 Returns a structured result dictionary.
 """
 
+"""
+loan_agent.py
+=============
+Public application interface for the bounded, tool-using loan agent.
+The Streamlit UI continues to call LoanAgent.process(user_data).
+"""
 import os
 import sys
-import joblib
+from typing import Dict, Any
+
+import numpy as np
 import pandas as pd
-from typing import Dict
 
-# Ensure src is on the path
+try:
+    import joblib
+except ImportError:
+    joblib = None
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from data_loader import load_bank_policies
-from feature_engineering import preprocess_user_input, FEATURE_COLUMNS
+from feature_engineering import preprocess_user_input
 from eligibility_rules import check_eligibility, get_eligible_banks, get_ineligible_banks
 from meta_learning_model import predict_approval_per_bank
-from recommendation_engine import rank_banks, get_best_bank
+from recommendation_engine import rank_banks
 from explainability import generate_explanation
+from agentic_controller import LoanDecisionAgent
+
+
+class HeuristicRiskModel:
+    """Transparent fallback used only when trained model artifacts are absent."""
+
+    def predict_proba(self, features: pd.DataFrame) -> np.ndarray:
+        row = features.iloc[0]
+        dti = float(row.get("dti", 0.0))
+        dti_pct = dti if dti > 1 else dti * 100
+        credit = float(row.get("credit_score_scaled", 0.5))
+        loan_ratio = float(row.get("loan_to_income", 0.0))
+        risk = (
+            0.45 * min(max(dti_pct / 50.0, 0.0), 1.0)
+            + 0.35 * (1.0 - min(max(credit, 0.0), 1.0))
+            + 0.20 * min(max(loan_ratio / 3.0, 0.0), 1.0)
+        )
+        risk = float(np.clip(risk, 0.01, 0.99))
+        return np.array([[1.0 - risk, risk]])
+
+    def predict(self, features: pd.DataFrame) -> np.ndarray:
+        return np.array([int(self.predict_proba(features)[0][1] >= 0.65)])
+
+
+class HeuristicApprovalModel:
+    """Fallback approval scorer with the same sklearn-like interface."""
+
+    def predict_proba(self, features: pd.DataFrame) -> np.ndarray:
+        row = features.iloc[0]
+        dti = float(row.get("dti", 0.0))
+        dti_pct = dti if dti > 1 else dti * 100
+        credit = float(row.get("credit_score_scaled", 0.5))
+        risk = 0.55 * min(max(dti_pct / 50.0, 0.0), 1.0) + 0.45 * (1 - credit)
+        approval = float(np.clip(1 - risk, 0.01, 0.99))
+        return np.array([[1.0 - approval, approval]])
 
 
 class LoanAgent:
-    """
-    Agentic AI system that orchestrates the full loan evaluation pipeline.
-    
-    Attributes
-    ----------
-    risk_model : trained model
-        Random Forest for default risk prediction.
-    approval_model : trained model
-        Gradient Boosting for approval prediction.
-    scaler : StandardScaler
-        Fitted feature scaler.
-    bank_policies : pd.DataFrame
-        Bank policy dataset.
-    """
-    
+    """Bounded agent that plans and executes auditable loan-evaluation tools."""
+
+    RISK_THRESHOLD = 0.65
+
     def __init__(self, models_dir: str = None, policies_path: str = None):
-        """
-        Initialize the agent by loading models and bank policies.
-        """
         if models_dir is None:
             base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            models_dir = os.path.join(base, 'models')
-        
-        # Load trained models
-        print("[Agent] Loading models...")
-        self.risk_model = joblib.load(os.path.join(models_dir, 'risk_model.pkl'))
-        self.approval_model = joblib.load(os.path.join(models_dir, 'approval_model.pkl'))
-        self.scaler = joblib.load(os.path.join(models_dir, 'scaler.pkl'))
-        print("[Agent] Models loaded successfully.")
-        
-        # Load bank policies
+            models_dir = os.path.join(base, "models")
+
+        self.using_fallback_models = False
+        try:
+            if joblib is None:
+                raise FileNotFoundError("joblib is not installed")
+            self.risk_model = joblib.load(os.path.join(models_dir, "risk_model.pkl"))
+            self.approval_model = joblib.load(os.path.join(models_dir, "approval_model.pkl"))
+            self.scaler = joblib.load(os.path.join(models_dir, "scaler.pkl"))
+        except (OSError, FileNotFoundError, ImportError, ValueError) as exc:
+            # The public repository does not ship model binaries.
+            print(f"[Agent] Trained models unavailable ({exc}); using safe heuristic fallback.")
+            self.risk_model = HeuristicRiskModel()
+            self.approval_model = HeuristicApprovalModel()
+            self.scaler = None
+            self.using_fallback_models = True
+
         self.bank_policies = load_bank_policies(policies_path)
-    
-    def process(self, user_data: dict) -> Dict:
-        """
-        Run the full agentic pipeline on a user's loan application.
-        
-        Parameters
-        ----------
-        user_data : dict
-            Keys: income, credit_score, loan_amount, emi, employment_type
-            
-        Returns
-        -------
-        dict
-            Complete result with: decision, risk_score, best_bank,
-            rankings, eligible_banks, explanation, probabilities
-        """
-        print("\n" + "=" * 70)
-        print("  [*] AGENTIC LOAN PROCESSING PIPELINE")
-        print("=" * 70)
-        
-        # ------------------------------------------------------------------
-        # Step 1: Preprocess Input
-        # ------------------------------------------------------------------
-        print("\n[Step 1] Preprocessing user input...")
-        income = user_data.get('income', 0)
-        credit_score = user_data.get('credit_score', 0)
-        loan_amount = user_data.get('loan_amount', 0)
-        emi = user_data.get('emi', 0)
-        emp_type = user_data.get('employment_type', 'Salaried')
-        
-        print(f"  Income: ${income:,.0f} | Credit: {credit_score} | "
-              f"Loan: ${loan_amount:,.0f} | EMI: ${emi:,.0f} | Emp: {emp_type}")
-        
-        # ------------------------------------------------------------------
-        # Step 2: Compute Features
-        # ------------------------------------------------------------------
-        print("\n[Step 2] Computing ratio-based features...")
-        features_df = preprocess_user_input(user_data, scaler=self.scaler)
-        features_unscaled = preprocess_user_input(user_data, scaler=None)
-        
-        monthly_income = income / 12
-        dti_ratio = (emi / monthly_income) if monthly_income > 0 else 1.0
-        loan_to_income = loan_amount / (income + 1)
-        emi_ratio = emi / (income + 1)
-        
-        print(f"  DTI: {dti_ratio:.4f} | Loan/Income: {loan_to_income:.4f} | EMI Ratio: {emi_ratio:.6f}")
-        
-        # ------------------------------------------------------------------
-        # Step 3: Predict Risk
-        # ------------------------------------------------------------------
-        print("\n[Step 3] Predicting default risk...")
-        risk_prob = self.risk_model.predict_proba(features_df)[0][1]
-        risk_class = self.risk_model.predict(features_df)[0]
-        print(f"  Risk Score: {risk_prob:.4f} | Risk Class: {'HIGH' if risk_class == 1 else 'LOW'}")
-        
-        # ------------------------------------------------------------------
-        # Step 4: Apply Bank Eligibility Rules
-        # ------------------------------------------------------------------
-        print("\n[Step 4] Checking bank eligibility...")
-        eligibility_results = check_eligibility(
-            credit_score=credit_score,
-            income=income,
-            dti=dti_ratio,
-            bank_policies=self.bank_policies
-        )
-        eligible = get_eligible_banks(eligibility_results)
-        ineligible = get_ineligible_banks(eligibility_results)
-        
-        # ------------------------------------------------------------------
-        # Decision logic
-        # ------------------------------------------------------------------
-        RISK_THRESHOLD = 0.65
-        
-        if not eligible or risk_prob > RISK_THRESHOLD:
-            # REJECTED
-            decision = 'REJECTED'
-            explanation = generate_explanation(
-                user_data=user_data,
-                decision=decision,
-                risk_score=risk_prob,
-                eligible_banks=eligible,
-                ineligible_banks=ineligible
+
+    @staticmethod
+    def _validate_application(user_data: Dict[str, Any]) -> Dict[str, Any]:
+        required = ("income", "credit_score", "loan_amount", "emi", "employment_type")
+        errors = [f"missing {key}" for key in required if key not in user_data]
+        for key in ("income", "credit_score", "loan_amount", "emi"):
+            if key in user_data:
+                try:
+                    if float(user_data[key]) < 0:
+                        errors.append(f"{key} cannot be negative")
+                except (TypeError, ValueError):
+                    errors.append(f"{key} must be numeric")
+        if "income" in user_data and float(user_data.get("income", 0)) == 0:
+            errors.append("income must be greater than zero")
+        return {"valid": not errors, "errors": errors}
+
+    def _tools(self) -> Dict[str, Any]:
+        def estimate_risk(user_data: Dict[str, Any]) -> Dict[str, Any]:
+            features = preprocess_user_input(user_data, scaler=self.scaler)
+            probability = float(self.risk_model.predict_proba(features)[0][1])
+            return {"risk_score": probability, "model": type(self.risk_model).__name__}
+
+        def screen_policies(user_data: Dict[str, Any]) -> Dict[str, Any]:
+            income = float(user_data["income"])
+            monthly_income = income / 12
+            dti = float(user_data["emi"]) / monthly_income if monthly_income else 1.0
+            results = check_eligibility(
+                credit_score=float(user_data["credit_score"]),
+                income=income,
+                dti=dti,
+                bank_policies=self.bank_policies,
             )
-            
             return {
-                'decision': decision,
-                'risk_score': round(float(risk_prob), 4),
-                'best_bank': None,
-                'rankings': [],
-                'eligible_banks': [b['bank'] for b in eligible],
-                'probabilities': {},
-                'explanation': explanation,
+                "all": results,
+                "eligible": get_eligible_banks(results),
+                "ineligible": get_ineligible_banks(results),
             }
-        
-        # ------------------------------------------------------------------
-        # Step 5: Meta-Learning -- Predict per-bank approval probability
-        # ------------------------------------------------------------------
-        print("\n[Step 5] Running meta-learning simulation...")
-        probabilities = predict_approval_per_bank(
-            user_features=features_df,
-            eligible_banks=eligible,
-            approval_model=self.approval_model
-        )
-        
-        # ------------------------------------------------------------------
-        # Step 6: Rank Banks
-        # ------------------------------------------------------------------
-        print("\n[Step 6] Ranking banks...")
-        rankings = rank_banks(
-            approval_probabilities=probabilities,
-            eligible_banks=eligible,
-            loan_amount=loan_amount,
-            income=income
-        )
-        best = get_best_bank(rankings)
-        
-        # ------------------------------------------------------------------
-        # Step 7: Generate Explanation
-        # ------------------------------------------------------------------
-        print("\n[Step 7] Generating explanation...")
-        decision = 'APPROVED'
-        explanation = generate_explanation(
-            user_data=user_data,
-            decision=decision,
-            risk_score=risk_prob,
-            eligible_banks=eligible,
-            ineligible_banks=ineligible,
-            best_bank=best,
-            rankings=rankings
-        )
-        
+
+        def stress_test(user_data: Dict[str, Any]) -> Dict[str, Any]:
+            # Check whether eligibility depends on a fragile income/EMI boundary.
+            stressed = dict(user_data)
+            stressed["income"] = float(user_data["income"]) * 0.90
+            stressed["emi"] = float(user_data["emi"]) * 1.10
+            monthly_income = stressed["income"] / 12
+            dti = stressed["emi"] / monthly_income if monthly_income else 1.0
+            results = check_eligibility(
+                credit_score=float(stressed["credit_score"]),
+                income=stressed["income"],
+                dti=dti,
+                bank_policies=self.bank_policies,
+            )
+            return {"eligible_count_under_stress": len(get_eligible_banks(results))}
+
+        def predict_bank_approval(user_data: Dict[str, Any], eligible_banks):
+            features = preprocess_user_input(user_data, scaler=self.scaler)
+            return predict_approval_per_bank(
+                user_features=features,
+                eligible_banks=eligible_banks,
+                approval_model=self.approval_model,
+            )
+
+        def rank_options(user_data: Dict[str, Any], eligible_banks, probabilities):
+            return rank_banks(
+                approval_probabilities=probabilities,
+                eligible_banks=eligible_banks,
+                loan_amount=float(user_data["loan_amount"]),
+                income=float(user_data["income"]),
+            )
+
+        def reflect_decision(risk_score, eligible_banks, stress_test=None):
+            if not eligible_banks:
+                return {"decision": "REJECTED", "reason": "No bank policy accepted the application."}
+            if risk_score > self.RISK_THRESHOLD:
+                return {"decision": "REJECTED", "reason": "Risk model exceeded the policy threshold."}
+            if stress_test and stress_test["eligible_count_under_stress"] == 0:
+                return {"decision": "REJECTED", "reason": "The application failed the affordability stress test."}
+            return {"decision": "APPROVED", "reason": "Policy checks, risk threshold, and agent reflection passed."}
+
         return {
-            'decision': decision,
-            'risk_score': round(float(risk_prob), 4),
-            'best_bank': best.get('bank') if best else None,
-            'rankings': rankings,
-            'eligible_banks': [b['bank'] for b in eligible],
-            'probabilities': probabilities,
-            'explanation': explanation,
+            "validate_application": self._validate_application,
+            "estimate_risk": estimate_risk,
+            "screen_policies": screen_policies,
+            "stress_test": stress_test,
+            "predict_bank_approval": predict_bank_approval,
+            "rank_banks": rank_options,
+            "reflect_decision": reflect_decision,
         }
 
+    def process(self, user_data: dict) -> Dict:
+        agent = LoanDecisionAgent(self._tools())
+        result = agent.run(user_data)
+        eligible = [{"bank": b} for b in result.get("eligible_banks", [])]
+        result["explanation"] = generate_explanation(
+            user_data=user_data,
+            decision=result["decision"],
+            risk_score=result["risk_score"],
+            eligible_banks=eligible,
+            ineligible_banks=result.get("ineligible_banks", []),
+            best_bank=result.get("rankings", [{}])[0] if result.get("rankings") else None,
+            rankings=result.get("rankings", []),
+        )
+        if self.using_fallback_models:
+            result["explanation"] += "\n\nNote: trained model files were not found; a transparent heuristic fallback was used."
+        return result
 
-# ---- CLI test ----
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     agent = LoanAgent()
-    
-    result = agent.process({
-        'income': 75000,
-        'credit_score': 720,
-        'loan_amount': 25000,
-        'emi': 1500,
-        'employment_type': 'Salaried'
-    })
-    
-    print("\n\n" + result['explanation'])
-    print(f"\nDecision: {result['decision']}")
-    print(f"Best Bank: {result['best_bank']}")
+    print(agent.process({
+        "income": 75000,
+        "credit_score": 720,
+        "loan_amount": 25000,
+        "emi": 1500,
+        "employment_type": "Salaried",
+    }))
